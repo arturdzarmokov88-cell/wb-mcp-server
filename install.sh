@@ -28,7 +28,7 @@ if [ ! -f .env ]; then
   echo
   if [ -z "$WB_API_TOKEN" ]; then echo "Токен пустой, выход."; exit 1; fi
 
-  MCP_SECRET=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40)
+  MCP_SECRET=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 || true)
   IP=$(curl -fsS https://api.ipify.org || curl -fsS https://ifconfig.me)
   # Бесплатное доменное имя для IP-адреса: 1.2.3.4 -> 1-2-3-4.sslip.io
   DOMAIN="$(echo "$IP" | tr '.' '-').sslip.io"
@@ -42,6 +42,8 @@ ENABLE_FEEDBACK_WRITE=false
 ENABLE_PRICE_WRITE=false
 MAX_PRICE_CHANGE_PCT=20
 MAX_DISCOUNT_PCT=70
+ENABLE_ADS_WRITE=false
+MAX_BID_CHANGE_PCT=30
 EOF
 fi
 
