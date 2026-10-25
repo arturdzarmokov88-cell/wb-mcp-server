@@ -1533,7 +1533,7 @@ async def _get_phrase_bids(campaign_id: int, nm_id: int) -> list[dict]:
 async def _phrase_bid_unit() -> str:
     """В чём WB принимает поле bid при записи: kopecks или rub. Определяется по факту (см. apply)."""
     saved = await meta_get("phrase_bid_unit")
-    return saved or os.environ.get("NORMQUERY_BID_UNIT", "kopecks")
+    return saved or os.environ.get("NORMQUERY_BID_UNIT", "rub")
 
 
 def _to_unit(kopecks: int, unit: str) -> int | float:
@@ -1675,9 +1675,14 @@ async def _apply_phrase_bids(payload: dict) -> dict:
     wanted = {b["q"]: b["k"] for b in bids}
 
     async def send(pairs: dict[str, int], unit: str) -> None:
-        await wb_request("advert", "POST", "/adv/v0/normquery/bids", body={"bids": [
+        r = await wb_request("advert", "POST", "/adv/v0/normquery/bids", body={"bids": [
             {"advert_id": advert_id, "nm_id": nm_id, "norm_query": q, "bid": _to_unit(k, unit)}
             for q, k in pairs.items()]})
+        log.info("WB normquery/bids unit=%s pairs=%s resp=%s", unit, pairs, r)
+        failed = (r or {}).get("failed") or [] if isinstance(r, dict) else []
+        if failed:
+            raise WBError("WB отклонил ставки: " + "; ".join(
+                f"{f.get('norm_query')}: {f.get('reason')}" for f in failed))
 
     async def readback() -> dict[str, int | None]:
         await asyncio.sleep(2)
