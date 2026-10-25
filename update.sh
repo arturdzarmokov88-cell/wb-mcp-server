@@ -17,6 +17,9 @@ add_default ENABLE_ADS_WRITE false
 add_default MAX_PRICE_CHANGE_PCT 20
 add_default MAX_DISCOUNT_PCT 70
 add_default MAX_BID_CHANGE_PCT 30
+add_default MAX_BID_RUB 1000
+add_default ENABLE_SYNC true
+add_default SYNC_INTERVAL_HOURS 3
 
 set_value() { sed -i "s|^$1=.*|$1=$2|" .env; }
 
@@ -52,8 +55,8 @@ fi
 
 echo
 echo "== 3. Секретный адрес =="
-read -r -p "   Сменить секретный адрес коннектора? [Y/n]: " ANSWER
-if [[ ! "${ANSWER:-}" =~ ^[NnНн] ]]; then
+read -r -p "   Сменить секретный адрес коннектора? (обычно НЕТ, иначе коннектор в Claude придётся добавлять заново) [y/N]: " ANSWER
+if [[ "${ANSWER:-}" =~ ^[YyДд] ]]; then
   NEW_SECRET=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40 || true)
   set_value MCP_SECRET "$NEW_SECRET"
   echo "   Адрес сменён: старый перестанет работать, в Claude нужно будет добавить новый."

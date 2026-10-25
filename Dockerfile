@@ -1,4 +1,5 @@
-FROM python:3.13-slim
+# Образ берётся с зеркала Google: Docker Hub из России часто недоступен.
+FROM mirror.gcr.io/library/python:3.13-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PORT=8080

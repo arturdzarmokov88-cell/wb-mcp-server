@@ -5,12 +5,16 @@ services:
     env_file: .env
     environment:
       PORT: "8080"
+      DB_PATH: /data/wb.db
+    volumes:
+      # База с историей по дням (реклама, остатки, воронка) переживает обновления.
+      - wb_data:/data
     expose:
       - "8080"
 
   # Caddy принимает HTTPS-запросы и сам получает сертификат Let's Encrypt.
   caddy:
-    image: caddy:2
+    image: mirror.gcr.io/library/caddy:2
     restart: unless-stopped
     ports:
       - "80:80"
@@ -25,5 +29,6 @@ services:
       - wb-mcp
 
 volumes:
+  wb_data:
   caddy_data:
   caddy_config:
