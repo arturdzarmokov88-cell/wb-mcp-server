@@ -20,14 +20,12 @@ API-ключ WB хранится только здесь, в переменны�
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -215,6 +213,10 @@ CREATE TABLE IF NOT EXISTS funnel_daily (
   PRIMARY KEY (day, nm_id)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS pending (
+  code TEXT PRIMARY KEY, action TEXT NOT NULL, payload TEXT NOT NULL,
+  expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created TEXT
+);
 """
 
 _db_conn: sqlite3.Connection | None = None
@@ -1277,50 +1279,61 @@ async def sync_history(days: int = 3) -> dict:
 # Запись: двухшаговое подтверждение
 # ---------------------------------------------------------------------------
 
-_SIGN_KEY = hashlib.sha256(b"confirm:" + MCP_SECRET.encode()).digest()
-# Уже применённые коды (в пределах одного экземпляра сервера).
-_used_codes: dict[str, float] = {}
+# Подготовленное изменение хранится на сервере (таблица pending в SQLite), а наружу
+# отдаётся только короткий случайный код. Код одноразовый и живёт CONFIRM_TTL_SECONDS.
+# Пережить перезапуск сервера он может, поэтому «подготовил → перезапуск → применил» работает.
+_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # без 0/O/1/I/L, чтобы не путать
+_CODE_LEN = 6
 
 
-def _b64(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+def _db_pending_add(action: str, payload: dict) -> tuple[str, int]:
+    now = int(time.time())
+    expires = now + CONFIRM_TTL_SECONDS
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with _db_lock:
+        conn = _db()
+        # старые записи держим сутки (для разбора по журналу), потом удаляем
+        conn.execute("DELETE FROM pending WHERE expires < ?", (now - 86400,))
+        for _ in range(50):
+            code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LEN))
+            try:
+                conn.execute(
+                    "INSERT INTO pending(code, action, payload, expires, used, created) VALUES (?,?,?,?,0,?)",
+                    (code, action, body, expires, _now_iso()),
+                )
+                conn.commit()
+                return code, expires
+            except sqlite3.IntegrityError:
+                continue
+    raise RuntimeError("Не удалось создать код подтверждения")
 
 
-def _unb64(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+def _norm_code(code: str) -> str:
+    return re.sub(r"[\s\-]", "", (code or "")).upper()
 
 
-def _sign(body: str) -> str:
-    return _b64(hmac.new(_SIGN_KEY, body.encode(), hashlib.sha256).digest()[:16])
+def _db_pending_take(code: str) -> tuple[str, dict | None]:
+    """Атомарно «берёт» код: возвращает ('ok', {a, p, e}) и помечает использованным."""
+    code = _norm_code(code)
+    with _db_lock:
+        conn = _db()
+        row = conn.execute("SELECT action, payload, expires, used FROM pending WHERE code=?", (code,)).fetchone()
+        if not row:
+            return "missing", None
+        if row["used"]:
+            return "used", None
+        if row["expires"] < time.time():
+            return "expired", None
+        cur = conn.execute("UPDATE pending SET used=1 WHERE code=? AND used=0", (code,))
+        conn.commit()
+        if cur.rowcount != 1:
+            return "used", None
+        return "ok", {"a": row["action"], "p": json.loads(row["payload"]), "e": row["expires"]}
 
 
-def _make_code(action: str, payload: dict) -> str:
-    body = _b64(json.dumps(
-        {"a": action, "p": payload, "e": int(time.time()) + CONFIRM_TTL_SECONDS},
-        ensure_ascii=False, separators=(",", ":"),
-    ).encode())
-    return f"{body}.{_sign(body)}"
-
-
-def _read_code(code: str) -> dict | None:
-    try:
-        body, sig = code.strip().split(".", 1)
-    except ValueError:
-        return None
-    if not hmac.compare_digest(sig, _sign(body)):
-        return None
-    try:
-        data = json.loads(_unb64(body))
-    except Exception:  # noqa: BLE001
-        return None
-    if data.get("e", 0) < time.time():
-        return None
-    return data
-
-
-def _new_confirmation(action: str, payload: dict, preview: dict) -> dict:
-    code = _make_code(action, payload)
-    audit.info("PREPARED %s sig=%s %s", action, code[-8:], json.dumps(payload, ensure_ascii=False))
+async def _new_confirmation(action: str, payload: dict, preview: dict) -> dict:
+    code, _ = await asyncio.to_thread(_db_pending_add, action, payload)
+    audit.info("PREPARED %s code=%s %s", action, code, json.dumps(payload, ensure_ascii=False))
     return {
         "preview": preview,
         "confirmation_code": code,
@@ -1336,7 +1349,7 @@ async def prepare_feedback_answer(feedback_id: str, text: str) -> dict:
         return {"error": "Запись ответов выключена (ENABLE_FEEDBACK_WRITE=false)."}
     if not 2 <= len(text) <= 5000:
         return {"error": "Длина ответа должна быть от 2 до 5000 символов."}
-    return _new_confirmation(
+    return await _new_confirmation(
         "feedback_answer",
         {"id": feedback_id, "text": text},
         {"отзыв": feedback_id, "ответ": text},
@@ -1350,7 +1363,7 @@ async def prepare_question_answer(question_id: str, text: str) -> dict:
         return {"error": "Запись ответов выключена (ENABLE_FEEDBACK_WRITE=false)."}
     if not 2 <= len(text) <= 5000:
         return {"error": "Длина ответа должна быть от 2 до 5000 символов."}
-    return _new_confirmation(
+    return await _new_confirmation(
         "question_answer",
         {"id": question_id, "text": text},
         {"вопрос": question_id, "ответ": text},
@@ -1394,7 +1407,7 @@ async def prepare_price_change(nm_id: int, new_price: int | None = None, new_dis
         payload["price"] = price
     if new_discount is not None:
         payload["discount"] = discount
-    return _new_confirmation(
+    return await _new_confirmation(
         "price_change",
         payload,
         {
@@ -1423,7 +1436,7 @@ async def prepare_ad_status(campaign_id: int, action: str) -> dict:
         return {"error": f"Запустить можно только кампанию «готова к запуску» или «на паузе», сейчас: {AD_STATUSES.get(status, status)}."}
     if action == "pause" and status != 9:
         return {"error": f"Поставить на паузу можно только активную кампанию, сейчас: {AD_STATUSES.get(status, status)}."}
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_status",
         {"id": campaign_id, "action": action},
         {
@@ -1467,7 +1480,7 @@ async def prepare_ad_bid(campaign_id: int, nm_id: int, new_bid_rub: float, place
             return {"error": f"Ставка меняется на {change:.0f}%, лимит {MAX_BID_CHANGE_PCT:.0f}%. "
                              "Разбейте изменение на шаги или поднимите MAX_BID_CHANGE_PCT."}
     place_ru = {"combined": "поиск и рекомендации", "search": "поиск", "recommendations": "рекомендации"}[placement]
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_bid",
         {"advert_id": campaign_id, "nm_id": nm_id, "bid_kopecks": new_kop, "placement": placement},
         {
@@ -1502,7 +1515,7 @@ async def prepare_ad_minus(campaign_id: int, nm_id: int, add: list[str] | None =
     if current and not new:
         return {"error": "Такое изменение удалит все минус-фразы. Если это нужно, подтвердите отдельно — "
                          "уберите фразы по частям, оставив хотя бы одну, или попросите пользователя явно."}
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_minus",
         {"advert_id": campaign_id, "nm_id": nm_id, "norm_queries": new},
         {
@@ -1629,7 +1642,7 @@ async def prepare_ad_phrase_bids(campaign_id: int, nm_id: int, changes: list[dic
         rows.append({"q": q, "k": new_kop, "o": own})
         was = f"{own / 100:.2f}" if own else (f"нет своей (общая {item_bid / 100:.2f})" if item_bid else "нет")
         preview_rows.append(f"{q}: {was} → {new_kop / 100:.2f}")
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_phrase_bids",
         {"advert_id": campaign_id, "nm_id": nm_id, "bids": rows},
         {"кампания": f"{campaign_id} «{(a.get('settings') or {}).get('name')}»", "товар": nm_id,
@@ -1657,7 +1670,7 @@ async def prepare_ad_phrase_bids_delete(campaign_id: int, nm_id: int, norm_queri
     missing = [q for q in queries if q not in current]
     if missing:
         return {"error": f"У этих фраз нет собственной ставки: {missing}"}
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_phrase_bids_delete",
         {"advert_id": campaign_id, "nm_id": nm_id, "queries": queries},
         {"кампания": f"{campaign_id} «{(a.get('settings') or {}).get('name')}»", "товар": nm_id,
@@ -1779,7 +1792,7 @@ async def prepare_ad_bids(campaign_id: int, bids: list[dict]) -> dict:
                                  "Разбейте изменение на шаги."}
         nm_bids.append({"nm_id": nm_id, "bid_kopecks": new_kop, "placement": placement})
         preview_rows.append(f"{nm_id}: {current / 100:.2f} → {new_kop / 100:.2f}")
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_bids",
         {"advert_id": campaign_id, "nm_bids": nm_bids},
         {"кампания": f"{campaign_id} «{(a.get('settings') or {}).get('name')}»",
@@ -1824,7 +1837,7 @@ async def prepare_ad_items(campaign_id: int, add: list[int] | None = None, delet
         bid = max(bids.get("search") or 0, bids.get("recommendations") or 0)
         return f"{nm_id} (ставка {bid / 100:.2f} ₽)" if bid else str(nm_id)
 
-    return _new_confirmation(
+    return await _new_confirmation(
         "ad_items",
         {"advert_id": campaign_id, "add": add, "delete": delete},
         {"кампания": f"{campaign_id} «{(a.get('settings') or {}).get('name')}»",
@@ -1838,16 +1851,12 @@ async def prepare_ad_items(campaign_id: int, add: list[int] | None = None, delet
 @mcp.tool()
 async def apply_change(confirmation_code: str) -> dict:
     """Шаг 2: применить подготовленное изменение. Вызывать ТОЛЬКО после явного согласия пользователя."""
-    item = _read_code(confirmation_code)
-    if not item:
-        return {"error": "Код неверный или истёк. Подготовьте изменение заново."}
-    now = time.time()
-    for k in [k for k, exp in _used_codes.items() if exp < now]:
-        del _used_codes[k]
-    if confirmation_code in _used_codes:
+    state, item = await asyncio.to_thread(_db_pending_take, confirmation_code)
+    if state == "used":
         return {"error": "Этот код уже использован. Подготовьте изменение заново."}
-    _used_codes[confirmation_code] = item["e"]
-    confirmation_code = confirmation_code[-8:]  # для журнала
+    if state != "ok" or not item:
+        return {"error": "Код неверный или истёк. Подготовьте изменение заново."}
+    confirmation_code = _norm_code(confirmation_code)  # для журнала
 
     action, payload = item["a"], item["p"]
     try:
