@@ -102,6 +102,18 @@ HOSTS = {
     "advert": "https://advert-api.wildberries.ru",
 }
 
+# Дополнительные разделы API: только для универсального чтения wb_api_read.
+# В проверку связи не входят, чтобы не пугать «нет доступа» по разделам, которые не нужны.
+EXTRA_HOSTS = {
+    "marketplace": "https://marketplace-api.wildberries.ru",   # заказы FBS, склады продавца
+    "common": "https://common-api.wildberries.ru",             # тарифы, комиссии, новости
+    "supplies": "https://supplies-api.wildberries.ru",         # поставки FBW, коэффициенты приёмки
+    "documents": "https://documents-api.wildberries.ru",       # документы
+    "returns": "https://returns-api.wildberries.ru",           # заявки покупателей на возврат
+    "buyer-chat": "https://buyer-chat-api.wildberries.ru",     # чат с покупателями
+}
+ALL_HOSTS = {**HOSTS, **EXTRA_HOSTS}
+
 # Методы статистики разрешают 1 запрос в минуту, поэтому кешируем ответы.
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 65
@@ -121,7 +133,7 @@ async def wb_request(
     cache: bool = False,
     cache_ttl: int = CACHE_TTL,
 ) -> Any:
-    url = HOSTS[service] + path
+    url = ALL_HOSTS[service] + path
     key = f"{method} {url} {json.dumps(params, sort_keys=True)} {json.dumps(body, sort_keys=True)}"
     if cache and key in _cache and time.time() - _cache[key][0] < cache_ttl:
         return _cache[key][1]
@@ -143,10 +155,10 @@ async def wb_request(
             break
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             last_err = e
-            log.warning("Нет соединения с %s (попытка %s): %s %s", HOSTS[service], attempt + 1, type(e).__name__, e)
+            log.warning("Нет соединения с %s (попытка %s): %s %s", ALL_HOSTS[service], attempt + 1, type(e).__name__, e)
             await asyncio.sleep(1 + attempt)
     if resp is None:
-        raise WBError(f"Нет связи с {HOSTS[service]} ({type(last_err).__name__}: {last_err}). "
+        raise WBError(f"Нет связи с {ALL_HOSTS[service]} ({type(last_err).__name__}: {last_err}). "
                       "Сервер не смог соединиться с WB, попробуйте ещё раз через минуту.")
 
     if resp.status_code == 429:
@@ -213,6 +225,9 @@ CREATE TABLE IF NOT EXISTS funnel_daily (
   PRIMARY KEY (day, nm_id)
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS cost_price (
+  nm_id INTEGER PRIMARY KEY, vendor_code TEXT, cost_rub REAL NOT NULL, updated TEXT
+);
 CREATE TABLE IF NOT EXISTS pending (
   code TEXT PRIMARY KEY, action TEXT NOT NULL, payload TEXT NOT NULL,
   expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, created TEXT
@@ -627,6 +642,22 @@ def _f(value: Any) -> float:
         return 0.0
 
 
+_FINANCE_FIELDS = ["rrdId", "nmId", "vendorCode", "docTypeName", "sellerOperName", "quantity",
+                   "retailAmount", "retailPriceWithDisc", "forPay", "deliveryService", "paidStorage",
+                   "penalty", "deduction", "paidAcceptance", "acquiringFee", "additionalPayment",
+                   "cashbackAmount", "saleDt"]
+
+
+async def _fetch_finance_rows(date_from: str, date_to: str, period: str = "weekly") -> list[dict]:
+    page = await wb_request(
+        "finance", "POST", "/api/finance/v1/sales-reports/detailed",
+        body={"dateFrom": date_from, "dateTo": date_to, "limit": 100000, "rrdId": 0,
+              "period": period, "fields": _FINANCE_FIELDS},
+        cache=True, cache_ttl=600,
+    )
+    return page or []
+
+
 @mcp.tool()
 async def get_finance_report(date_from: str, date_to: str, period: str = "weekly", details: bool = False) -> dict:
     """Детализация отчётов о реализации (финансы) за период, даты YYYY-MM-DD.
@@ -634,17 +665,7 @@ async def get_finance_report(date_from: str, date_to: str, period: str = "weekly
     Сводка: продажи, возвраты, к перечислению, логистика, хранение, штрафы, удержания."""
     if period not in ("weekly", "daily"):
         return {"error": "period должен быть weekly или daily"}
-    fields = ["rrdId", "nmId", "vendorCode", "docTypeName", "sellerOperName", "quantity",
-              "retailAmount", "retailPriceWithDisc", "forPay", "deliveryService", "paidStorage",
-              "penalty", "deduction", "paidAcceptance", "acquiringFee", "additionalPayment",
-              "cashbackAmount", "saleDt"]
-    page = await wb_request(
-        "finance", "POST", "/api/finance/v1/sales-reports/detailed",
-        body={"dateFrom": date_from, "dateTo": date_to, "limit": 100000, "rrdId": 0,
-              "period": period, "fields": fields},
-        cache=True, cache_ttl=600,
-    )
-    rows: list[dict] = page or []
+    rows = await _fetch_finance_rows(date_from, date_to, period)
 
     def s(field: str, where=lambda r: True) -> float:
         return round(sum(_f(r.get(field)) for r in rows if where(r)), 2)
@@ -1273,6 +1294,287 @@ async def sync_history(days: int = 3) -> dict:
     status = await _history_status()
     status["started_now"] = started
     return status
+
+
+# ---------------------------------------------------------------------------
+# Универсальное чтение любого метода WB API
+# ---------------------------------------------------------------------------
+
+_MAX_RAW_CHARS = 60000
+
+
+@mcp.tool()
+async def wb_api_read(service: str, path: str, params: dict | None = None) -> dict:
+    """Прочитать ЛЮБОЙ GET-метод WB API, для которого нет отдельного инструмента
+    (только чтение, ничего не меняет). service — раздел: statistics, analytics, content,
+    prices, feedbacks, finance, advert, marketplace (FBS), common (тарифы и комиссии),
+    supplies (поставки, коэффициенты приёмки), documents, returns, buyer-chat.
+    path — путь из документации dev.wildberries.ru, например «/api/v1/tariffs/commission»
+    в common или «/api/v1/acceptance/coefficients» в supplies. params — параметры запроса.
+    Токен должен иметь доступ к разделу. Длинные ответы обрезаются."""
+    if service not in ALL_HOSTS:
+        return {"error": f"Неизвестный раздел {service}. Доступны: {', '.join(ALL_HOSTS)}"}
+    if not path.startswith("/") or ".." in path or "://" in path or "?" in path:
+        return {"error": "path должен начинаться с «/» и не содержать «..», «?» и адреса сайта. "
+                         "Параметры передавайте в params."}
+    data = await wb_request(service, "GET", path, params=params or {}, cache=True, cache_ttl=60)
+    text = json.dumps(data, ensure_ascii=False)
+    if len(text) > _MAX_RAW_CHARS:
+        return {"truncated": True, "total_chars": len(text),
+                "hint": "Ответ слишком большой: сузьте период или используйте limit/offset в params.",
+                "data_head": text[:_MAX_RAW_CHARS]}
+    return {"data": data}
+
+
+# ---------------------------------------------------------------------------
+# Себестоимость и прибыль по артикулам
+# ---------------------------------------------------------------------------
+# Себестоимость WB не знает, поэтому она хранится в базе сервера. Это локальные данные,
+# в кабинет WB ничего не отправляется, поэтому подтверждение кодом не требуется.
+
+
+@mcp.tool()
+async def set_cost_prices(items: list[dict]) -> dict:
+    """Сохранить себестоимость единицы товара (пряжа, работа, упаковка, доставка до склада)
+    в базе сервера. items: [{"nm_id": 123, "cost_rub": 450}] или [{"vendor_code": "FROST-1",
+    "cost_rub": 450}]. В WB ничего не отправляется. Нужна для get_profit_report."""
+    if not items:
+        return {"error": "Передайте хотя бы один товар."}
+    by_vendor: dict[str, dict] = {}
+    by_nm: dict[int, dict] = {}
+    for c in await _fetch_cards(1000):
+        if c.get("nmID"):
+            by_nm[c["nmID"]] = c
+            if c.get("vendorCode"):
+                by_vendor[str(c["vendorCode"]).strip().lower()] = c
+    rows, errors = [], []
+    for it in items:
+        try:
+            cost = float(it.get("cost_rub"))
+        except (TypeError, ValueError):
+            errors.append({"item": it, "error": "cost_rub должен быть числом"})
+            continue
+        if not 0 < cost < 1_000_000:
+            errors.append({"item": it, "error": "cost_rub должен быть больше 0 и меньше 1 000 000"})
+            continue
+        nm = it.get("nm_id")
+        card = by_nm.get(int(nm)) if nm else by_vendor.get(str(it.get("vendor_code") or "").strip().lower())
+        if not card:
+            errors.append({"item": it, "error": "товар не найден среди карточек"})
+            continue
+        rows.append((card["nmID"], card.get("vendorCode"), round(cost, 2), _now_iso()))
+    await adb_write("INSERT OR REPLACE INTO cost_price(nm_id, vendor_code, cost_rub, updated) VALUES (?,?,?,?)", rows)
+    audit.info("COST_PRICES %s", json.dumps(rows, ensure_ascii=False))
+    return {"saved": [{"nm_id": r[0], "vendor_code": r[1], "cost_rub": r[2]} for r in rows], "errors": errors}
+
+
+@mcp.tool()
+async def get_cost_prices() -> dict:
+    """Сохранённая себестоимость по товарам и список карточек, для которых её ещё нет."""
+    saved = await adb_query("SELECT nm_id, vendor_code, cost_rub, updated FROM cost_price ORDER BY vendor_code")
+    have = {r["nm_id"] for r in saved}
+    cards = await _fetch_cards(1000)
+    missing = [{"nm_id": c["nmID"], "vendor_code": c.get("vendorCode"), "title": c.get("title")}
+               for c in cards if c.get("nmID") and c["nmID"] not in have]
+    return {"cost_prices": saved, "without_cost": missing}
+
+
+def _abc(items: list[dict], key: str) -> None:
+    """Проставляет класс ABC по доле в сумме key: A — первые 80%, B — следующие 15%, C — остальное."""
+    total = sum(max(i.get(key) or 0, 0) for i in items)
+    acc = 0.0
+    for i in sorted(items, key=lambda x: x.get(key) or 0, reverse=True):
+        share_before = acc / total if total else 1
+        acc += max(i.get(key) or 0, 0)
+        i["abc"] = "A" if share_before < 0.8 else ("B" if share_before < 0.95 else "C")
+        i["revenue_share_pct"] = round((i.get(key) or 0) / total * 100, 1) if total else None
+
+
+@mcp.tool()
+async def get_profit_report(date_from: str, date_to: str, tax_pct: float = 1.0,
+                            tax_base: str = "retail", period: str = "weekly") -> dict:
+    """Чистая прибыль по каждому артикулу за период (YYYY-MM-DD) с классом ABC.
+    Берёт финансовый отчёт WB (к перечислению, логистика, хранение, штрафы, удержания),
+    расход на рекламу из базы сервера и себестоимость из set_cost_prices, вычитает налог.
+    tax_pct — ставка налога в процентах (УСН «доходы» в Дагестане 1%).
+    tax_base: retail — от суммы продаж покупателю (retailAmount), for_pay — от суммы
+    к перечислению. Какую базу использовать, уточните у бухгалтера.
+    Финотчёт WB выходит раз в неделю (по понедельникам), поэтому берите целые недели."""
+    if tax_base not in ("retail", "for_pay"):
+        return {"error": "tax_base должен быть retail или for_pay"}
+    if not 0 <= tax_pct <= 30:
+        return {"error": "tax_pct должен быть от 0 до 30"}
+    rows = await _fetch_finance_rows(date_from, date_to, period)
+    if not rows:
+        return {"error": "WB не вернул строк финотчёта за этот период.",
+                "hint": "Отчёт формируется раз в неделю; проверьте, что период захватывает закрытую неделю."}
+
+    costs = {r["nm_id"]: r["cost_rub"] for r in await adb_query("SELECT nm_id, cost_rub FROM cost_price")}
+    ads = {r["nm_id"]: r["spend"] or 0 for r in await adb_query(
+        "SELECT nm_id, SUM(spend) spend FROM ad_daily WHERE day BETWEEN ? AND ? GROUP BY nm_id", (date_from, date_to))}
+    ads_days = (await adb_query("SELECT COUNT(DISTINCT day) n FROM ad_daily WHERE day BETWEEN ? AND ?",
+                                (date_from, date_to)))[0]["n"]
+
+    zero = lambda: {"vendor_code": None, "sold": 0, "returned": 0, "revenue": 0.0, "for_pay": 0.0,  # noqa: E731
+                    "logistics": 0.0, "storage": 0.0, "penalties": 0.0, "deductions": 0.0,
+                    "acceptance": 0.0, "correction": 0.0}
+    agg: dict[int, dict] = defaultdict(zero)
+    for r in rows:
+        a = agg[r.get("nmId") or 0]
+        a["vendor_code"] = a["vendor_code"] or r.get("vendorCode")
+        doc = r.get("docTypeName")
+        qty = int(_f(r.get("quantity")))
+        if doc == "Продажа":
+            a["sold"] += qty
+            a["revenue"] += _f(r.get("retailAmount"))
+            a["for_pay"] += _f(r.get("forPay"))
+        elif doc == "Возврат":
+            a["returned"] += qty
+            a["revenue"] -= _f(r.get("retailAmount"))
+            a["for_pay"] -= _f(r.get("forPay"))
+        a["logistics"] += _f(r.get("deliveryService"))
+        a["storage"] += _f(r.get("paidStorage"))
+        a["penalties"] += _f(r.get("penalty"))
+        a["deductions"] += _f(r.get("deduction"))
+        a["acceptance"] += _f(r.get("paidAcceptance"))
+        a["correction"] += _f(r.get("additionalPayment"))
+
+    items, missing_cost = [], []
+    total = defaultdict(float)
+    for nm, a in agg.items():
+        net_units = a["sold"] - a["returned"]
+        cost_unit = costs.get(nm) if nm else None
+        if nm and cost_unit is None and net_units:
+            missing_cost.append({"nm_id": nm, "vendor_code": a["vendor_code"]})
+        cost = (cost_unit or 0) * net_units
+        ad = ads.get(nm, 0) if nm else 0
+        tax = (a["revenue"] if tax_base == "retail" else a["for_pay"]) * tax_pct / 100
+        wb_costs = a["logistics"] + a["storage"] + a["penalties"] + a["deductions"] + a["acceptance"]
+        profit = a["for_pay"] - wb_costs + a["correction"] - ad - cost - tax
+        for k, v in (("revenue", a["revenue"]), ("for_pay", a["for_pay"]), ("wb_costs", wb_costs),
+                     ("correction", a["correction"]), ("ads", ad), ("cost", cost), ("tax", tax), ("profit", profit)):
+            total[k] += v
+        total["net_units"] += net_units
+        if not nm:
+            total["unassigned_wb_costs"] += wb_costs - a["correction"]
+            continue
+        items.append({
+            "nm_id": nm, "vendor_code": a["vendor_code"],
+            "sold": a["sold"], "returned": a["returned"], "net_units": net_units,
+            "revenue_rub": round(a["revenue"], 2), "for_pay_rub": round(a["for_pay"], 2),
+            "logistics_rub": round(a["logistics"], 2), "storage_rub": round(a["storage"], 2),
+            "penalties_and_deductions_rub": round(a["penalties"] + a["deductions"] + a["acceptance"], 2),
+            "ads_rub": round(ad, 2), "cost_rub": round(cost, 2) if cost_unit is not None else None,
+            "tax_rub": round(tax, 2), "profit_rub": round(profit, 2),
+            "profit_per_unit_rub": round(profit / net_units, 2) if net_units > 0 else None,
+            "margin_pct": _pct(profit, a["revenue"]),
+            "roi_pct": _pct(profit, cost) if cost > 0 else None,
+            "drr_pct": _pct(ad, a["revenue"]),
+        })
+    _abc(items, "revenue_rub")
+    items.sort(key=lambda x: x["profit_rub"], reverse=True)
+
+    want_days = (datetime.strptime(date_to, "%Y-%m-%d") - datetime.strptime(date_from, "%Y-%m-%d")).days + 1
+    notes = ["profit = к перечислению − услуги WB + корректировки − реклама − себестоимость − налог.",
+             "Строки финотчёта без артикула (общее хранение, штрафы) входят только в total."]
+    if missing_cost:
+        notes.append("Нет себестоимости у части товаров: их прибыль завышена. Задайте её через set_cost_prices.")
+    if ads_days < want_days:
+        notes.append(f"Реклама в базе есть за {ads_days} из {want_days} дней: расход на рекламу может быть занижен.")
+    r2 = lambda v: round(v, 2)  # noqa: E731
+    return {
+        "period": f"{date_from} — {date_to}",
+        "tax": f"{tax_pct}% от {'продаж покупателю' if tax_base == 'retail' else 'суммы к перечислению'}",
+        "total": {"net_units": int(total["net_units"]), "revenue_rub": r2(total["revenue"]),
+                  "for_pay_rub": r2(total["for_pay"]), "wb_costs_rub": r2(total["wb_costs"]),
+                  "correction_rub": r2(total["correction"]),
+                  "ads_rub": r2(total["ads"]), "cost_rub": r2(total["cost"]), "tax_rub": r2(total["tax"]),
+                  "profit_rub": r2(total["profit"]), "margin_pct": _pct(total["profit"], total["revenue"]),
+                  "unassigned_wb_costs_rub": r2(total["unassigned_wb_costs"])},
+        "items": items,
+        "missing_cost": missing_cost,
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# План дозаказа (поставок на склад WB)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_reorder_plan(days: int = 14, lead_time_days: int = 14, safety_days: int = 7,
+                           vendor_prefix: str | None = None) -> dict:
+    """Что и сколько довезти на склады WB, по артикулам и размерам.
+    Скорость продаж = заказы без отмен за последние days дней / days. Запас в днях =
+    остаток на складах WB / скорость. lead_time_days — сколько дней от решения до поступления
+    на склад WB (вязание + упаковка + доставка + приёмка), safety_days — страховой запас.
+    Рекомендация довезти = скорость × (lead_time_days + safety_days) − остаток.
+    Товар в пути к клиентам и возвраты в запас не входят."""
+    days = max(7, min(days, 60))
+    start = (datetime.now(MSK) - timedelta(days=days)).date().isoformat()
+    stocks = await _fetch_stocks()
+    if "items" not in stocks:
+        return {"error": stocks.get("status", "отчёт об остатках не готов, повторите через минуту")}
+    orders = await wb_request("statistics", "GET", "/api/v1/supplier/orders",
+                              params={"dateFrom": start}, cache=True) or []
+
+    demand: dict[tuple, int] = defaultdict(int)
+    vendor: dict[int, str] = {}
+    for o in orders:
+        if o.get("isCancel") or str(o.get("date") or "")[:10] < start:
+            continue
+        key = (o.get("nmId"), str(o.get("techSize") or ""))
+        demand[key] += 1
+        vendor[o.get("nmId")] = o.get("supplierArticle")
+
+    stock: dict[tuple, dict] = {}
+    for it in stocks["items"]:
+        if not it.get("nmId"):
+            continue
+        key = (it["nmId"], str(it.get("size") or ""))
+        s = stock.setdefault(key, {"on": 0, "way": 0, "ret": 0})
+        s["on"] += it.get("on_warehouses") or 0
+        s["way"] += it.get("in_way_to_clients") or 0
+        s["ret"] += it.get("in_way_returns") or 0
+        vendor.setdefault(it["nmId"], it.get("vendorCode"))
+
+    horizon = lead_time_days + safety_days
+    items = []
+    for key in set(demand) | set(stock):
+        nm, size = key
+        vc = vendor.get(nm)
+        if vendor_prefix and not str(vc or "").lower().startswith(vendor_prefix.lower()):
+            continue
+        sold = demand.get(key, 0)
+        s = stock.get(key, {"on": 0, "way": 0, "ret": 0})
+        speed = sold / days
+        cover = round(s["on"] / speed, 1) if speed else None
+        need = max(0, round(speed * horizon - s["on"])) if speed else 0
+        if speed and s["on"] == 0:
+            status = "нет в наличии"
+        elif cover is not None and cover < lead_time_days:
+            status = "срочно: закончится раньше, чем успеете довезти"
+        elif cover is not None and cover < horizon:
+            status = "пора готовить поставку"
+        elif not speed and s["on"]:
+            status = "нет заказов за период"
+        else:
+            status = "запаса хватает"
+        items.append({"nm_id": nm, "vendor_code": vc, "size": size or None,
+                      "orders_per_day": round(speed, 2), "orders_in_period": sold,
+                      "stock_on_warehouses": s["on"], "in_way_to_clients": s["way"], "returns_in_way": s["ret"],
+                      "days_of_cover": cover, "recommended_to_ship": need, "status": status})
+    rank = {"нет в наличии": 0, "срочно: закончится раньше, чем успеете довезти": 1,
+            "пора готовить поставку": 2, "запаса хватает": 3, "нет заказов за период": 4}
+    items.sort(key=lambda x: (rank.get(x["status"], 9), -(x["orders_per_day"] or 0)))
+    return {
+        "window": f"заказы с {start}, {days} дн.",
+        "horizon_days": horizon,
+        "total_recommended_to_ship": sum(i["recommended_to_ship"] for i in items),
+        "items": items,
+        "note": "Сезонность не учитывается: перед пиком (холода) скорость растёт, закладывайте запас больше.",
+    }
 
 
 # ---------------------------------------------------------------------------
